@@ -10,7 +10,6 @@ declare(strict_types=1);
 
 namespace Pollen\Asset;
 
-use Illuminate\Foundation\ViteManifestNotFoundException;
 use Illuminate\Support\Facades\Vite;
 use Pollen\Support\Facades\Action;
 use Pollen\Support\Facades\Filter;
@@ -52,34 +51,6 @@ class Asset
      * @var bool Flag indicating whether Vite should be used
      */
     protected bool $useVite = false;
-
-    /**
-     * The path to the build directory.
-     *
-     * @var string
-     */
-    protected $buildDirectory = 'build';
-
-    /**
-     * The name of the manifest file.
-     *
-     * @var string
-     */
-    protected $manifestFilename = 'manifest.json';
-
-    /**
-     * The cached manifest files.
-     *
-     * @var array
-     */
-    protected static $manifests = [];
-
-    /**
-     * The path to the "hot" file.
-     *
-     * @var string|null
-     */
-    protected $hotFile;
 
     /**
      * @var null|int The version number to be set. Set to null if no version provided.
@@ -134,16 +105,6 @@ class Asset
     }
 
     /**
-     * Determine if the HMR server is running.
-     *
-     * @return bool
-     */
-    public function isRunningHot()
-    {
-        return Vite::isRunningHot();
-    }
-
-    /**
      * Set an array of dependencies for the styule or script.
      *
      * @param  array  $dependencies An array of dependencies for the style or script.
@@ -170,92 +131,11 @@ class Asset
     {
         $this->useVite = true;
 
-        if (Vite::isRunningHot()) {
-            $this->handleHotAssets();
-        }
-
-        $this->lookupAssetInManifest();
+        $this->path = Vite::isRunningHot()
+            ? $this->vite->retrieveHotAsset($this->path)
+            : $this->vite->lookupAssetInManifest($this->path);
 
         return $this;
-    }
-
-    /**
-     * Handle hot assets for the current style.
-     *
-     * This method retrieves the hot asset path using the `hotAsset` method
-     * and updates the `path` property with the new hot asset path.
-     *
-     * If the Vite asset server is not loaded, it sets the `requireViteClient`
-     * property to true and loads the Vite asset server using the `loadVite` method
-     * within the `vite` object.
-     *
-     * @return void
-     */
-    private function handleHotAssets()
-    {
-        $hotAsset = $this->hotAsset($this->path);
-        $this->path = $hotAsset;
-
-        if (! $this->vite->viteLoaded()) {
-            $this->requireViteClient = true;
-            $this->vite->loadVite();
-        }
-    }
-
-    /**
-     * Lookup an asset in the manifest.
-     *
-     * This method looks up the given asset path in the manifest array.
-     * If the asset path exists in the manifest, it modifies the asset path to
-     * include the full URL to the asset file.
-     *
-     * @return void
-     */
-    private function lookupAssetInManifest()
-    {
-        $manifest = $this->manifest($this->buildDirectory);
-
-        if (isset($manifest[$this->path])) {
-            $this->path = home_url().'/'.$this->buildDirectory.'/'.$manifest[$this->path]['file'];
-        }
-    }
-
-    /**
-     * Get the the manifest file for the given build directory.
-     *
-     * @param  string  $buildDirectory
-     * @return array
-     *
-     * @throws \Illuminate\Foundation\ViteManifestNotFoundException
-     */
-    protected function manifest($buildDirectory)
-    {
-        $path = $this->manifestPath($buildDirectory);
-
-        if (! isset(static::$manifests[$path])) {
-            if (! is_file($path)) {
-                throw new ViteManifestNotFoundException("Vite manifest not found at: $path");
-            }
-
-            static::$manifests[$path] = json_decode(file_get_contents($path), true);
-        }
-
-        return static::$manifests[$path];
-    }
-
-    protected function manifestPath($buildDirectory)
-    {
-        return public_path($buildDirectory.'/'.$this->manifestFilename);
-    }
-
-    /**
-     * Get the path to a given asset when running in HMR mode.
-     *
-     * @return string
-     */
-    protected function hotAsset($asset)
-    {
-        return rtrim(file_get_contents(Vite::hotFile())).'/'.$asset;
     }
 
     /**
@@ -409,6 +289,14 @@ class Asset
         return $this;
     }
 
+    /**
+     * It is responsible for registering the enqueueStyleOrScript() method to the
+     * specified hooks.
+     *
+     * If the `hook` property is empty, it defaults to using the 'wp_enqueue_scripts' hook.
+     *
+     * @return void
+     */
     public function __destruct()
     {
         if (empty($this->hook)) {
@@ -416,13 +304,37 @@ class Asset
         }
 
         foreach ($this->hook as $hook) {
-            if ($this->useVite && Vite::isRunningHot() && $this->requireViteClient) {
-                Action::add($hook, function () {
-                    echo '<script type="module" src="'.$this->hotAsset('@vite/client').'"></script>'."\n";
-                }, 1);
-            }
+            $this->maybeLoadViteClient($hook);
             Action::add($hook, [$this, 'enqueueStyleOrScript'], 99);
         }
+    }
+
+    /**
+     * Determine if the Vite client needs to be loaded in the specified hook.
+     *
+     * @param  string  $hook The hook to check for Vite client loading.
+     * @return bool True if the Vite client needs to be loaded in the specified hook, false otherwise.
+     */
+    protected function needToLoadViteClient(string $hook): bool
+    {
+        return $this->useVite && Vite::isRunningHot() && ! $this->vite->loadedInHook($hook);
+    }
+
+    /**
+     * Load Vite client if necessary.
+     *
+     * This method checks if the Vite client needs to be loaded for a given hook.
+     * If it does, it loads the Vite client using the Vite instance and echos the script tag.
+     *
+     * @param  string  $hook The hook name.
+     */
+    protected function maybeLoadViteClient(string $hook): void
+    {
+        Action::add($hook, function () use ($hook) {
+            if ($this->needToLoadViteClient($hook)) {
+                echo $this->vite->viteClientHtml($hook)->toHtml();
+            }
+        }, 1);
     }
 
     /**
